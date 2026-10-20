@@ -358,8 +358,8 @@ const WorkItem = struct { block_index: usize, header_offset: usize };
 pub const ImmixAllocator = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    blocks: std.ArrayList(Block) = .empty,
-    worklist: std.ArrayList(WorkItem) = .empty,
+    blocks: std.ArrayListUnmanaged(Block) = .empty,
+    worklist: std.ArrayListUnmanaged(WorkItem) = .empty,
     trace_fn: ?TraceObjectFn = null,
     trace_context: ?*anyopaque = null,
     mark_id: u32 = DEFAULT_MARK_ID,
@@ -674,7 +674,7 @@ test "hole recycling and multi-block allocation" {
     defer heap.deinit();
 
     // Allocate 100 objects of 200 bytes each across blocks
-    var ptrs = std.ArrayList(usize).empty;
+    var ptrs: std.ArrayListUnmanaged(usize) = .empty;
     defer ptrs.deinit(std.testing.allocator);
 
     var i: usize = 0;
@@ -686,7 +686,7 @@ test "hole recycling and multi-block allocation" {
     try std.testing.expect(heap.blockCount() > 0);
 
     // Keep only even objects alive
-    var live_roots = std.ArrayList(usize).empty;
+    var live_roots: std.ArrayListUnmanaged(usize) = .empty;
     defer live_roots.deinit(std.testing.allocator);
 
     for (ptrs.items, 0..) |ptr, index| {
@@ -706,7 +706,7 @@ test "hole recycling and multi-block allocation" {
     try std.testing.expectEqual(@as(usize, 50), stats1.objects_reclaimed);
 
     // Re-allocate into freed holes
-    var new_ptrs = std.ArrayList(usize).empty;
+    var new_ptrs: std.ArrayListUnmanaged(usize) = .empty;
     defer new_ptrs.deinit(std.testing.allocator);
 
     i = 0;
@@ -715,7 +715,7 @@ test "hole recycling and multi-block allocation" {
         try new_ptrs.append(std.testing.allocator, @intFromPtr(obj.ptr));
     }
 
-    var all_roots = std.ArrayList(usize).empty;
+    var all_roots: std.ArrayListUnmanaged(usize) = .empty;
     defer all_roots.deinit(std.testing.allocator);
     try all_roots.appendSlice(std.testing.allocator, live_roots.items);
     try all_roots.appendSlice(std.testing.allocator, new_ptrs.items);
