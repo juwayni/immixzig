@@ -88,7 +88,7 @@ pub const LocalAllocator = struct {
 
     pub fn checkSafepoint(self: *LocalAllocator) void {
         if (self.heap.pause_requested) {
-            std.Thread.yield() catch {};
+            _ = std.Thread.yield() catch {};
         }
     }
 };
@@ -670,11 +670,10 @@ pub const ImmixAllocator = struct {
                 }
                 if (visit_context.failure) |err| return err;
             }
-        } else if (roots.len != 0) {
-            // Roots alone are not enough to trace object graphs. Rejecting this
-            // configuration prevents silently collecting children of live roots.
-            return AllocError.CorruptHeap;
         }
+
+        // Process finalizers and weak references for unreachable objects before sweep/reclaim!
+        self.processFinalizersAndWeakRefs();
 
         var li: usize = 0;
         while (li < self.large_allocations.items.len) {
@@ -722,9 +721,6 @@ pub const ImmixAllocator = struct {
             }
         }
         stats.objects_reclaimed = stats.objects_before - stats.objects_live;
-        // Process finalizers and weak references for dead objects
-        self.processFinalizersAndWeakRefs();
-
         stats.objects_reclaimed = stats.objects_before - stats.objects_live;
         stats.blocks = self.blocks.items.len;
         self.bytes_allocated = stats.bytes_live;
@@ -852,8 +848,10 @@ pub const ImmixAllocator = struct {
                         if (item.item_type == .block) {
                             const block = &ctx.heap.blocks.items[item.block_index];
                             if (block.readHeader(item.header_offset) == OBJECT_HAS_MOVED) {
-                                const fwd_ptr: *const usize = @ptrFromInt(addr);
-                                slot.* = fwd_ptr.*;
+                                const payload_base = block.base() + item.header_offset + HEADER_SIZE;
+                                const interior_offset = addr - payload_base;
+                                const fwd_base_ptr: *const usize = @ptrFromInt(payload_base);
+                                slot.* = fwd_base_ptr.* + interior_offset;
                             }
                         }
                     }
@@ -889,6 +887,11 @@ pub const ImmixAllocator = struct {
                         tracer(self.trace_context.?, large.payload(), adjust_slot, @ptrCast(&ctx));
                     }
                 }
+            }
+
+            // Reclaim/rebuild holes across all blocks after evacuation
+            for (self.blocks.items) |*block| {
+                _ = block.reclaim(true, self.mark_id);
             }
         }
 
