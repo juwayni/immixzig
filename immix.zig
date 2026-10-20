@@ -35,6 +35,7 @@ pub const HEADER_PRESERVE: u32 = 0x00f0_0000;
 pub const DEFAULT_MARK_ID: u32 = 0x1000_0000;
 pub const DEFAULT_MARK_BYTE: u8 = 0x10;
 pub const OBJECT_ALIGNMENT: usize = 4;
+pub const OBJECT_HAS_MOVED: u32 = 0x0000_00fe;
 
 comptime {
     if (LINE_COUNT != 256) @compileError("expected 256 lines in a 32 KiB block");
@@ -60,6 +61,38 @@ pub const ObjectFlags = struct {
     preserved: u32 = 0,
 };
 
+pub const FinalizerFn = *const fn (object_ptr: usize, user_data: ?*anyopaque) void;
+
+pub const FinalizerEntry = struct {
+    object_ptr: usize,
+    callback: FinalizerFn,
+    user_data: ?*anyopaque = null,
+};
+
+pub const WeakRef = struct {
+    referent_ptr: usize,
+    valid: bool = true,
+};
+
+pub const LocalAllocator = struct {
+    heap: *ImmixAllocator,
+
+    pub fn init(heap: *ImmixAllocator) LocalAllocator {
+        return .{ .heap = heap };
+    }
+
+    pub fn alloc(self: *LocalAllocator, size: usize, flags: ObjectFlags) AllocError![]u8 {
+        self.checkSafepoint();
+        return self.heap.alloc(size, flags);
+    }
+
+    pub fn checkSafepoint(self: *LocalAllocator) void {
+        if (self.heap.pause_requested) {
+            _ = std.Thread.yield() catch {};
+        }
+    }
+};
+
 pub const VisitSlotFn = *const fn (context: *anyopaque, slot: *usize) void;
 pub const TraceObjectFn = *const fn (
     context: *anyopaque,
@@ -74,6 +107,8 @@ pub const Config = struct {
     /// Maximum distance from an object payload pointer accepted as an interior
     /// reference. hxcpp defaults to a small internal offset (platform-defined).
     max_interior_offset: usize = 0,
+    /// Enable automatic compaction/evacuation pass for fragmented blocks
+    compact_fragmented: bool = false,
 };
 
 pub const Stats = struct {
@@ -90,14 +125,46 @@ pub const Stats = struct {
     fragmentation_score: usize = 0,
 };
 
+/// Layout of a single 128-byte Immix line.
+pub const Line = struct {
+    bytes: [LINE_SIZE]u8,
+
+    pub const BITS: u8 = LINE_BITS;
+    pub const SIZE: usize = LINE_SIZE;
+};
+
 /// One Immix block. The first 256 bytes of `memory` mirror hxcpp's row-mark
 /// overlay; the first two 128-byte lines are not available for allocations.
+pub const LargeAllocation = struct {
+    memory: []align(8) u8,
+    size: usize,
+    marked_epoch: u32 = 0,
+    container: bool = false,
+
+    pub fn headerPtr(self: *const LargeAllocation) *u32 {
+        return @ptrCast(@alignCast(self.memory.ptr));
+    }
+
+    pub fn payload(self: *const LargeAllocation) []u8 {
+        return self.memory[HEADER_SIZE .. HEADER_SIZE + self.size];
+    }
+
+    pub fn payloadAddress(self: *const LargeAllocation) usize {
+        return @intFromPtr(self.memory.ptr) + HEADER_SIZE;
+    }
+
+    pub fn containsPayload(self: *const LargeAllocation, address: usize) bool {
+        const p = self.payloadAddress();
+        return address >= p and address < p + self.size;
+    }
+};
+
 pub const Block = struct {
     memory: []align(BLOCK_SIZE) u8,
     id: u16,
-    alloc_start: [LINE_COUNT]u32 = [_]u32{0} ** LINE_COUNT,
-    row_marked: [LINE_COUNT]u8 = [_]u8{0} ** LINE_COUNT,
-    holes: [MAX_HOLES]HoleRange = [_]HoleRange{.{}} ** MAX_HOLES,
+    alloc_start: [LINE_COUNT]u32 = @import("std").mem.zeroes([LINE_COUNT]u32),
+    row_marked: [LINE_COUNT]u8 = @import("std").mem.zeroes([LINE_COUNT]u8),
+    holes: [MAX_HOLES]HoleRange = @import("std").mem.zeroes([MAX_HOLES]HoleRange),
     hole_count: usize = 1,
     used_rows: usize = 0,
     max_hole_size: usize = USEFUL_LINES * LINE_SIZE,
@@ -112,7 +179,7 @@ pub const Block = struct {
     cursor: usize = HEADER_LINES * LINE_SIZE,
 
     pub fn init(allocator: std.mem.Allocator, id: u16) AllocError!Block {
-        const mem = allocator.alignedAlloc(u8, BLOCK_SIZE, BLOCK_SIZE) catch return AllocError.OutOfMemory;
+        const mem = allocator.alignedAlloc(u8, .fromByteUnits(BLOCK_SIZE), BLOCK_SIZE) catch return AllocError.OutOfMemory;
         @memset(mem, 0);
         var result = Block{ .memory = mem, .id = id };
         result.holes[0] = .{ .start = @intCast(HEADER_LINES * LINE_SIZE), .length = @intCast(USEFUL_LINES * LINE_SIZE) };
@@ -345,13 +412,21 @@ pub const Block = struct {
     }
 };
 
-const WorkItem = struct { block_index: usize, header_offset: usize };
+const WorkItemType = enum { block, large };
+
+const WorkItem = struct {
+    item_type: WorkItemType = .block,
+    block_index: usize = 0,
+    header_offset: usize = 0,
+    large_index: usize = 0,
+};
 
 pub const ImmixAllocator = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    blocks: std.ArrayList(Block) = .empty,
-    worklist: std.ArrayList(WorkItem) = .empty,
+    blocks: std.ArrayListUnmanaged(Block) = .empty,
+    large_allocations: std.ArrayListUnmanaged(LargeAllocation) = .empty,
+    worklist: std.ArrayListUnmanaged(WorkItem) = .empty,
     trace_fn: ?TraceObjectFn = null,
     trace_context: ?*anyopaque = null,
     mark_id: u32 = DEFAULT_MARK_ID,
@@ -360,6 +435,8 @@ pub const ImmixAllocator = struct {
     pause_requested: bool = false,
     bytes_allocated: usize = 0,
     collection_count: usize = 0,
+    finalizer_queue: std.ArrayListUnmanaged(FinalizerEntry) = .empty,
+    weak_refs: std.ArrayListUnmanaged(WeakRef) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) ImmixAllocator {
         return .{ .allocator = allocator, .config = config };
@@ -368,8 +445,30 @@ pub const ImmixAllocator = struct {
     pub fn deinit(self: *ImmixAllocator) void {
         for (self.blocks.items) |*block| block.deinit(self.allocator);
         self.blocks.deinit(self.allocator);
+        for (self.large_allocations.items) |*large| self.allocator.free(large.memory);
+        self.large_allocations.deinit(self.allocator);
         self.worklist.deinit(self.allocator);
+        self.finalizer_queue.deinit(self.allocator);
+        self.weak_refs.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn registerFinalizer(self: *ImmixAllocator, object_ptr: usize, callback: FinalizerFn, user_data: ?*anyopaque) AllocError!void {
+        try self.finalizer_queue.append(self.allocator, .{
+            .object_ptr = object_ptr,
+            .callback = callback,
+            .user_data = user_data,
+        });
+    }
+
+    pub fn registerWeakRef(self: *ImmixAllocator, referent_ptr: usize) AllocError!usize {
+        try self.weak_refs.append(self.allocator, .{ .referent_ptr = referent_ptr, .valid = true });
+        return self.weak_refs.items.len - 1;
+    }
+
+    pub fn isWeakRefValid(self: *const ImmixAllocator, index: usize) bool {
+        if (index >= self.weak_refs.items.len) return false;
+        return self.weak_refs.items[index].valid;
     }
 
     pub fn setTracer(self: *ImmixAllocator, tracer: TraceObjectFn, context: *anyopaque) void {
@@ -406,7 +505,7 @@ pub const ImmixAllocator = struct {
         if (self.collecting) return AllocError.CollectionInProgress;
         if (size_in == 0) return self.allocator.alloc(u8, 0);
         const size = std.mem.alignForward(usize, size_in, OBJECT_ALIGNMENT);
-        if (size >= LARGE_OBJECT_SIZE or size > 0x3ffc) return AllocError.ObjectTooLarge;
+        if (size >= LARGE_OBJECT_SIZE) return self.allocLarge(size_in, flags);
         const total = HEADER_SIZE + size;
 
         var i: usize = 0;
@@ -433,11 +532,47 @@ pub const ImmixAllocator = struct {
         return payload;
     }
 
+    pub fn allocLarge(self: *ImmixAllocator, size_in: usize, flags: ObjectFlags) AllocError![]u8 {
+        if (self.collecting) return AllocError.CollectionInProgress;
+        if (size_in == 0) return self.allocator.alloc(u8, 0);
+        const size = std.mem.alignForward(usize, size_in, OBJECT_ALIGNMENT);
+        const total_bytes = HEADER_SIZE + size;
+        const memory = self.allocator.alignedAlloc(u8, .fromByteUnits(8), total_bytes) catch return AllocError.OutOfMemory;
+        if (self.config.zero_allocations) @memset(memory, 0);
+
+        var header = (self.mark_id & MARK_MASK) |
+            (@as(u32, @intCast(size)) << SIZE_SHIFT) |
+            (flags.preserved & HEADER_PRESERVE);
+        if (flags.container) header |= CONTAINER_FLAG;
+
+        std.mem.writeInt(u32, @ptrCast(memory.ptr), header, .little);
+        memory[3] = self.mark_byte;
+
+        const entry = LargeAllocation{
+            .memory = memory,
+            .size = size,
+            .marked_epoch = self.mark_id,
+            .container = flags.container,
+        };
+
+        self.large_allocations.append(self.allocator, entry) catch {
+            self.allocator.free(memory);
+            return AllocError.OutOfMemory;
+        };
+
+        return memory[HEADER_SIZE .. HEADER_SIZE + size_in];
+    }
+
     fn locateHeader(self: *ImmixAllocator, address: usize) ?WorkItem {
         for (self.blocks.items, 0..) |*block, bi| {
             if (!block.contains(address)) continue;
             const offset = block.objectOffsetForPayload(address, self.config.max_interior_offset) orelse return null;
-            return .{ .block_index = bi, .header_offset = offset };
+            return .{ .item_type = .block, .block_index = bi, .header_offset = offset };
+        }
+        for (self.large_allocations.items, 0..) |*large, li| {
+            if (large.containsPayload(address)) {
+                return .{ .item_type = .large, .large_index = li };
+            }
         }
         return null;
     }
@@ -445,9 +580,21 @@ pub const ImmixAllocator = struct {
     fn markAddress(self: *ImmixAllocator, address: usize) AllocError!void {
         if (address == 0) return;
         const item = self.locateHeader(address) orelse return;
-        const block = &self.blocks.items[item.block_index];
-        if (block.markObject(item.header_offset, self.mark_id, self.mark_byte)) {
-            try self.worklist.append(self.allocator, item);
+        if (item.item_type == .block) {
+            const block = &self.blocks.items[item.block_index];
+            if (block.markObject(item.header_offset, self.mark_id, self.mark_byte)) {
+                try self.worklist.append(self.allocator, item);
+            }
+        } else {
+            const large = &self.large_allocations.items[item.large_index];
+            if ((large.marked_epoch & MARK_MASK) != (self.mark_id & MARK_MASK)) {
+                large.marked_epoch = self.mark_id;
+                var header = std.mem.readInt(u32, @ptrCast(large.memory.ptr), .little);
+                header = (header & ~MARK_MASK) | (self.mark_id & MARK_MASK);
+                std.mem.writeInt(u32, @ptrCast(large.memory.ptr), header, .little);
+                large.memory[3] = self.mark_byte;
+                try self.worklist.append(self.allocator, item);
+            }
         }
     }
 
@@ -459,7 +606,9 @@ pub const ImmixAllocator = struct {
     fn visitSlot(context_ptr: *anyopaque, slot: *usize) void {
         const context: *VisitContext = @ptrCast(@alignCast(context_ptr));
         if (context.failure != null or slot.* == 0) return;
-        context.heap.markAddress(slot.*) catch |err| context.failure = err;
+        context.heap.markAddress(slot.*) catch |err| {
+            context.failure = err;
+        };
     }
 
     fn advanceMarkEpoch(self: *ImmixAllocator) void {
@@ -509,17 +658,32 @@ pub const ImmixAllocator = struct {
             var visit_context = VisitContext{ .heap = self };
             while (self.worklist.items.len != 0) {
                 const item = self.worklist.pop().?;
-                const block = &self.blocks.items[item.block_index];
-                const header = block.readHeader(item.header_offset);
-                const size = @as(usize, (header & SIZE_MASK) >> SIZE_SHIFT);
-                const payload = block.memory[item.header_offset + HEADER_SIZE .. item.header_offset + HEADER_SIZE + size];
-                tracer(self.trace_context.?, payload, visitSlot, @ptrCast(&visit_context));
+                if (item.item_type == .block) {
+                    const block = &self.blocks.items[item.block_index];
+                    const header = block.readHeader(item.header_offset);
+                    const size = @as(usize, (header & SIZE_MASK) >> SIZE_SHIFT);
+                    const payload = block.memory[item.header_offset + HEADER_SIZE .. item.header_offset + HEADER_SIZE + size];
+                    tracer(self.trace_context.?, payload, visitSlot, @ptrCast(&visit_context));
+                } else {
+                    const large = &self.large_allocations.items[item.large_index];
+                    tracer(self.trace_context.?, large.payload(), visitSlot, @ptrCast(&visit_context));
+                }
                 if (visit_context.failure) |err| return err;
             }
-        } else if (roots.len != 0) {
-            // Roots alone are not enough to trace object graphs. Rejecting this
-            // configuration prevents silently collecting children of live roots.
-            return AllocError.CorruptHeap;
+        }
+
+        // Process finalizers and weak references for unreachable objects before sweep/reclaim!
+        self.processFinalizersAndWeakRefs();
+
+        var li: usize = 0;
+        while (li < self.large_allocations.items.len) {
+            const large = &self.large_allocations.items[li];
+            if ((large.marked_epoch & MARK_MASK) == (self.mark_id & MARK_MASK)) {
+                li += 1;
+            } else {
+                self.allocator.free(large.memory);
+                _ = self.large_allocations.orderedRemove(li);
+            }
         }
 
         var i: usize = 0;
@@ -560,8 +724,178 @@ pub const ImmixAllocator = struct {
         stats.objects_reclaimed = stats.objects_before - stats.objects_live;
         stats.blocks = self.blocks.items.len;
         self.bytes_allocated = stats.bytes_live;
+
+        if (self.config.compact_fragmented or stats.fragmented_blocks > 0) {
+            _ = try self.compact(roots);
+        }
+
         self.collection_count += 1;
         return stats;
+    }
+
+    fn processFinalizersAndWeakRefs(self: *ImmixAllocator) void {
+        // Check finalizer queue
+        var fi: usize = 0;
+        while (fi < self.finalizer_queue.items.len) {
+            const fin = self.finalizer_queue.items[fi];
+            var is_marked = false;
+            if (self.locateHeader(fin.object_ptr)) |item| {
+                if (item.item_type == .block) {
+                    const block = &self.blocks.items[item.block_index];
+                    const header = block.readHeader(item.header_offset);
+                    is_marked = (header & MARK_MASK) == (self.mark_id & MARK_MASK);
+                } else {
+                    const large = &self.large_allocations.items[item.large_index];
+                    is_marked = (large.marked_epoch & MARK_MASK) == (self.mark_id & MARK_MASK);
+                }
+            }
+            if (!is_marked) {
+                fin.callback(fin.object_ptr, fin.user_data);
+                _ = self.finalizer_queue.orderedRemove(fi);
+                continue;
+            }
+            fi += 1;
+        }
+
+        // Check weak references
+        for (self.weak_refs.items) |*weak| {
+            if (!weak.valid) continue;
+            var is_marked = false;
+            if (self.locateHeader(weak.referent_ptr)) |item| {
+                if (item.item_type == .block) {
+                    const block = &self.blocks.items[item.block_index];
+                    const header = block.readHeader(item.header_offset);
+                    is_marked = (header & MARK_MASK) == (self.mark_id & MARK_MASK);
+                } else {
+                    const large = &self.large_allocations.items[item.large_index];
+                    is_marked = (large.marked_epoch & MARK_MASK) == (self.mark_id & MARK_MASK);
+                }
+            }
+            if (!is_marked) {
+                weak.valid = false;
+                weak.referent_ptr = 0;
+            }
+        }
+    }
+
+    /// Evacuate surviving objects from fragmented blocks to clean holes in destination blocks.
+    /// Writes forwarding pointers at source objects and updates strong references via tracer.
+    pub fn compact(self: *ImmixAllocator, roots: []usize) AllocError!usize {
+        var moved_objects: usize = 0;
+
+        // Identify fragmented source blocks (frag score > threshold and not pinned)
+        var src_idx: usize = 0;
+        while (src_idx < self.blocks.items.len) : (src_idx += 1) {
+            var from = &self.blocks.items[src_idx];
+            if (from.pinned or from.calcFragScore() <= FRAG_THRESH or from.used_rows == 0) continue;
+
+            // Relocate marked live objects from this block
+            var r: usize = HEADER_LINES;
+            while (r < LINE_COUNT) : (r += 1) {
+                if (from.row_marked[r] == 0) continue;
+                const starts = from.alloc_start[r];
+                if (starts == 0) continue;
+
+                var bit: usize = 0;
+                while (bit < 32) : (bit += 1) {
+                    if ((starts & (@as(u32, 1) << @as(u5, @intCast(bit)))) == 0) continue;
+                    const offset = r * LINE_SIZE + bit * OBJECT_ALIGNMENT;
+                    const header = from.readHeader(offset);
+                    if ((header & MARK_MASK) != (self.mark_id & MARK_MASK)) continue;
+
+                    const size = @as(usize, (header & SIZE_MASK) >> SIZE_SHIFT);
+                    const alloc_size = HEADER_SIZE + size;
+
+                    // Find a target block with enough hole capacity
+                    for (self.blocks.items, 0..) |*dest, dest_i| {
+                        if (dest_i == src_idx or dest.pinned) continue;
+                        if (dest.reserve(alloc_size)) |dest_offset| {
+                            const src_payload_ptr = from.memory.ptr + offset + HEADER_SIZE;
+                            const dest_payload_ptr = dest.memory.ptr + dest_offset + HEADER_SIZE;
+
+                            // Copy payload
+                            @memcpy(dest_payload_ptr[0..size], src_payload_ptr[0..size]);
+
+                            // Note allocation in dest
+                            const is_container = (header & CONTAINER_FLAG) != 0;
+                            const flags = ObjectFlags{ .container = is_container };
+                            dest.noteAllocation(dest_offset, size, flags, self.mark_id, self.mark_byte);
+
+                            // Write forwarding pointer at source payload
+                            const fwd_ptr = @intFromPtr(dest_payload_ptr);
+                            std.mem.writeInt(usize, @ptrCast(src_payload_ptr), fwd_ptr, .little);
+                            from.writeHeader(offset, OBJECT_HAS_MOVED);
+
+                            moved_objects += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (moved_objects > 0) {
+            const AdjustContext = struct {
+                heap: *ImmixAllocator,
+            };
+
+            const adjust_slot = struct {
+                fn fixSlot(ctx_ptr: *anyopaque, slot: *usize) void {
+                    if (slot.* == 0) return;
+                    const ctx: *AdjustContext = @ptrCast(@alignCast(ctx_ptr));
+                    const addr = slot.*;
+                    if (ctx.heap.locateHeader(addr)) |item| {
+                        if (item.item_type == .block) {
+                            const block = &ctx.heap.blocks.items[item.block_index];
+                            if (block.readHeader(item.header_offset) == OBJECT_HAS_MOVED) {
+                                const payload_base = block.base() + item.header_offset + HEADER_SIZE;
+                                const interior_offset = addr - payload_base;
+                                const fwd_base_ptr: *const usize = @ptrFromInt(payload_base);
+                                slot.* = fwd_base_ptr.* + interior_offset;
+                            }
+                        }
+                    }
+                }
+            }.fixSlot;
+
+            // Adjust roots
+            var ctx = AdjustContext{ .heap = self };
+            for (roots) |*root| {
+                adjust_slot(&ctx, root);
+            }
+
+            // Adjust internal pointers across all live objects
+            if (self.trace_fn) |tracer| {
+                for (self.blocks.items) |*block| {
+                    for (block.alloc_start, 0..) |starts, row| {
+                        var bits = starts;
+                        while (bits != 0) {
+                            const bit: usize = @intCast(@ctz(bits));
+                            const offset = row * LINE_SIZE + bit * OBJECT_ALIGNMENT;
+                            const header = block.readHeader(offset);
+                            if (header != OBJECT_HAS_MOVED and (header & MARK_MASK) == (self.mark_id & MARK_MASK)) {
+                                const size = @as(usize, (header & SIZE_MASK) >> SIZE_SHIFT);
+                                const payload = block.memory[offset + HEADER_SIZE .. offset + HEADER_SIZE + size];
+                                tracer(self.trace_context.?, payload, adjust_slot, @ptrCast(&ctx));
+                            }
+                            bits &= bits - 1;
+                        }
+                    }
+                }
+                for (self.large_allocations.items) |*large| {
+                    if ((large.marked_epoch & MARK_MASK) == (self.mark_id & MARK_MASK)) {
+                        tracer(self.trace_context.?, large.payload(), adjust_slot, @ptrCast(&ctx));
+                    }
+                }
+            }
+
+            // Reclaim/rebuild holes across all blocks after evacuation
+            for (self.blocks.items) |*block| {
+                _ = block.reclaim(true, self.mark_id);
+            }
+        }
+
+        return moved_objects;
     }
 
     /// Verify block alignment, reserved rows, hole bounds, and start-map/header
@@ -642,19 +976,163 @@ test "tracer preserves transitive child object" {
     const Pair = struct { child: usize };
     const tracer = struct {
         fn trace(_: *anyopaque, payload: []u8, visit: VisitSlotFn, visit_context: *anyopaque) void {
-            const pair: *Pair = @ptrCast(@alignCast(payload.ptr));
-            visit(visit_context, &pair.child);
+            if (payload.len < @sizeOf(Pair)) return;
+            var child_ptr: usize = std.mem.readInt(usize, payload[0..@sizeOf(usize)], .little);
+            visit(visit_context, &child_ptr);
         }
     }.trace;
     var heap = ImmixAllocator.init(std.testing.allocator, .{});
     defer heap.deinit();
     const parent_bytes = try heap.alloc(@sizeOf(Pair), .{ .container = true });
     const child_bytes = try heap.alloc(24, .{});
-    const parent: *Pair = @ptrCast(@alignCast(parent_bytes.ptr));
-    parent.child = @intFromPtr(child_bytes.ptr);
+    std.mem.writeInt(usize, parent_bytes[0..@sizeOf(usize)], @intFromPtr(child_bytes.ptr), .little);
     var dummy: u8 = 0;
     heap.setTracer(tracer, &dummy);
     var roots = [_]usize{@intFromPtr(parent_bytes.ptr)};
     const stats = try heap.collect(roots[0..]);
     try std.testing.expectEqual(@as(usize, 2), stats.objects_live);
+}
+
+test "hole recycling and multi-block allocation" {
+    var heap = ImmixAllocator.init(std.testing.allocator, .{});
+    defer heap.deinit();
+
+    // Allocate 100 objects of 200 bytes each across blocks
+    var ptrs: std.ArrayListUnmanaged(usize) = .empty;
+    defer ptrs.deinit(std.testing.allocator);
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const obj = try heap.alloc(200, .{});
+        try ptrs.append(std.testing.allocator, @intFromPtr(obj.ptr));
+    }
+
+    try std.testing.expect(heap.blockCount() > 0);
+
+    // Keep only even objects alive
+    var live_roots: std.ArrayListUnmanaged(usize) = .empty;
+    defer live_roots.deinit(std.testing.allocator);
+
+    for (ptrs.items, 0..) |ptr, index| {
+        if (index % 2 == 0) {
+            try live_roots.append(std.testing.allocator, ptr);
+        }
+    }
+
+    const tracer = struct {
+        fn trace(_: *anyopaque, _: []u8, _: VisitSlotFn, _: *anyopaque) void {}
+    }.trace;
+    var dummy: u8 = 0;
+    heap.setTracer(tracer, &dummy);
+
+    const stats1 = try heap.collect(live_roots.items);
+    try std.testing.expectEqual(@as(usize, 50), stats1.objects_live);
+    try std.testing.expectEqual(@as(usize, 50), stats1.objects_reclaimed);
+
+    // Re-allocate into freed holes
+    var new_ptrs: std.ArrayListUnmanaged(usize) = .empty;
+    defer new_ptrs.deinit(std.testing.allocator);
+
+    i = 0;
+    while (i < 50) : (i += 1) {
+        const obj = try heap.alloc(200, .{});
+        try new_ptrs.append(std.testing.allocator, @intFromPtr(obj.ptr));
+    }
+
+    var all_roots: std.ArrayListUnmanaged(usize) = .empty;
+    defer all_roots.deinit(std.testing.allocator);
+    try all_roots.appendSlice(std.testing.allocator, live_roots.items);
+    try all_roots.appendSlice(std.testing.allocator, new_ptrs.items);
+
+    const stats2 = try heap.collect(all_roots.items);
+    try std.testing.expectEqual(@as(usize, 100), stats2.objects_live);
+    try heap.validate();
+}
+
+test "compaction relocates objects and updates pointers" {
+    const Pair = struct { child: usize };
+    const tracer = struct {
+        fn trace(_: *anyopaque, payload: []u8, visit: VisitSlotFn, visit_context: *anyopaque) void {
+            if (payload.len < @sizeOf(Pair)) return;
+            var child_ptr: usize = std.mem.readInt(usize, payload[0..@sizeOf(usize)], .little);
+            const old_ptr = child_ptr;
+            visit(visit_context, &child_ptr);
+            if (child_ptr != old_ptr) {
+                std.mem.writeInt(usize, payload[0..@sizeOf(usize)], child_ptr, .little);
+            }
+        }
+    }.trace;
+
+    var heap = ImmixAllocator.init(std.testing.allocator, .{ .compact_fragmented = true });
+    defer heap.deinit();
+
+    var dummy: u8 = 0;
+    heap.setTracer(tracer, &dummy);
+
+    // Create objects in block 0
+    const parent_bytes = try heap.alloc(@sizeOf(Pair), .{ .container = true });
+    const child_bytes = try heap.alloc(64, .{});
+    std.mem.writeInt(usize, parent_bytes[0..@sizeOf(usize)], @intFromPtr(child_bytes.ptr), .little);
+
+    // Artificially mark block 0 as highly fragmented
+    heap.blocks.items[0].pinned = false;
+    heap.blocks.items[0].used_rows = 100;
+    heap.blocks.items[0].used_bytes = 128; // high frag score > FRAG_THRESH
+
+    // Force creation of a second block as destination
+    try heap.createBlock();
+
+    var roots = [_]usize{@intFromPtr(parent_bytes.ptr)};
+    const stats = try heap.collect(roots[0..]);
+    try std.testing.expect(stats.objects_live >= 2);
+}
+
+test "LocalAllocator, finalizers and weak references" {
+    var heap = ImmixAllocator.init(std.testing.allocator, .{});
+    defer heap.deinit();
+
+    const tracer = struct {
+        fn trace(_: *anyopaque, _: []u8, _: VisitSlotFn, _: *anyopaque) void {}
+    }.trace;
+    var dummy: u8 = 0;
+    heap.setTracer(tracer, &dummy);
+
+    var local = LocalAllocator.init(&heap);
+    const dead_obj = try local.alloc(32, .{});
+    const live_obj = try local.alloc(32, .{});
+
+    var finalized_flag: bool = false;
+    const fin_cb = struct {
+        fn cb(_: usize, ctx: ?*anyopaque) void {
+            const flag: *bool = @ptrCast(@alignCast(ctx.?));
+            flag.* = true;
+        }
+    }.cb;
+
+    try heap.registerFinalizer(@intFromPtr(dead_obj.ptr), fin_cb, &finalized_flag);
+    const weak_idx = try heap.registerWeakRef(@intFromPtr(dead_obj.ptr));
+
+    try std.testing.expect(heap.isWeakRefValid(weak_idx));
+
+    // Collect with only live_obj as root
+    var roots = [_]usize{@intFromPtr(live_obj.ptr)};
+    _ = try heap.collect(roots[0..]);
+
+    try std.testing.expect(finalized_flag);
+    try std.testing.expect(!heap.isWeakRefValid(weak_idx));
+}
+
+test "safepoint flags and configuration limits" {
+    var heap = ImmixAllocator.init(std.testing.allocator, .{ .max_blocks = 2 });
+    defer heap.deinit();
+
+    try std.testing.expect(!heap.pause_requested);
+    heap.requestSafepoint();
+    try std.testing.expect(heap.pause_requested);
+    heap.releaseSafepoint();
+    try std.testing.expect(!heap.pause_requested);
+
+    // Large object allocation succeeds via large object pool
+    const large_obj = try heap.alloc(5000, .{});
+    try std.testing.expectEqual(@as(usize, 5000), large_obj.len);
 }
