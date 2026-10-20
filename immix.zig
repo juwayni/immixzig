@@ -90,14 +90,22 @@ pub const Stats = struct {
     fragmentation_score: usize = 0,
 };
 
+/// Layout of a single 128-byte Immix line.
+pub const Line = struct {
+    bytes: [LINE_SIZE]u8,
+
+    pub const BITS: u8 = LINE_BITS;
+    pub const SIZE: usize = LINE_SIZE;
+};
+
 /// One Immix block. The first 256 bytes of `memory` mirror hxcpp's row-mark
 /// overlay; the first two 128-byte lines are not available for allocations.
 pub const Block = struct {
     memory: []align(BLOCK_SIZE) u8,
     id: u16,
-    alloc_start: [LINE_COUNT]u32 = [_]u32{0} ** LINE_COUNT,
-    row_marked: [LINE_COUNT]u8 = [_]u8{0} ** LINE_COUNT,
-    holes: [MAX_HOLES]HoleRange = [_]HoleRange{.{}} ** MAX_HOLES,
+    alloc_start: [LINE_COUNT]u32 = @import("std").mem.zeroes([LINE_COUNT]u32),
+    row_marked: [LINE_COUNT]u8 = @import("std").mem.zeroes([LINE_COUNT]u8),
+    holes: [MAX_HOLES]HoleRange = @import("std").mem.zeroes([MAX_HOLES]HoleRange),
     hole_count: usize = 1,
     used_rows: usize = 0,
     max_hole_size: usize = USEFUL_LINES * LINE_SIZE,
@@ -112,7 +120,7 @@ pub const Block = struct {
     cursor: usize = HEADER_LINES * LINE_SIZE,
 
     pub fn init(allocator: std.mem.Allocator, id: u16) AllocError!Block {
-        const mem = allocator.alignedAlloc(u8, BLOCK_SIZE, BLOCK_SIZE) catch return AllocError.OutOfMemory;
+        const mem = allocator.alignedAlloc(u8, .fromByteUnits(BLOCK_SIZE), BLOCK_SIZE) catch return AllocError.OutOfMemory;
         @memset(mem, 0);
         var result = Block{ .memory = mem, .id = id };
         result.holes[0] = .{ .start = @intCast(HEADER_LINES * LINE_SIZE), .length = @intCast(USEFUL_LINES * LINE_SIZE) };
@@ -459,7 +467,9 @@ pub const ImmixAllocator = struct {
     fn visitSlot(context_ptr: *anyopaque, slot: *usize) void {
         const context: *VisitContext = @ptrCast(@alignCast(context_ptr));
         if (context.failure != null or slot.* == 0) return;
-        context.heap.markAddress(slot.*) catch |err| context.failure = err;
+        context.heap.markAddress(slot.*) catch |err| {
+            context.failure = err;
+        };
     }
 
     fn advanceMarkEpoch(self: *ImmixAllocator) void {
@@ -642,19 +652,89 @@ test "tracer preserves transitive child object" {
     const Pair = struct { child: usize };
     const tracer = struct {
         fn trace(_: *anyopaque, payload: []u8, visit: VisitSlotFn, visit_context: *anyopaque) void {
-            const pair: *Pair = @ptrCast(@alignCast(payload.ptr));
-            visit(visit_context, &pair.child);
+            if (payload.len < @sizeOf(Pair)) return;
+            var child_ptr: usize = std.mem.readInt(usize, payload[0..@sizeOf(usize)], .little);
+            visit(visit_context, &child_ptr);
         }
     }.trace;
     var heap = ImmixAllocator.init(std.testing.allocator, .{});
     defer heap.deinit();
     const parent_bytes = try heap.alloc(@sizeOf(Pair), .{ .container = true });
     const child_bytes = try heap.alloc(24, .{});
-    const parent: *Pair = @ptrCast(@alignCast(parent_bytes.ptr));
-    parent.child = @intFromPtr(child_bytes.ptr);
+    std.mem.writeInt(usize, parent_bytes[0..@sizeOf(usize)], @intFromPtr(child_bytes.ptr), .little);
     var dummy: u8 = 0;
     heap.setTracer(tracer, &dummy);
     var roots = [_]usize{@intFromPtr(parent_bytes.ptr)};
     const stats = try heap.collect(roots[0..]);
     try std.testing.expectEqual(@as(usize, 2), stats.objects_live);
+}
+
+test "hole recycling and multi-block allocation" {
+    var heap = ImmixAllocator.init(std.testing.allocator, .{});
+    defer heap.deinit();
+
+    // Allocate 100 objects of 200 bytes each across blocks
+    var ptrs = std.ArrayList(usize).empty;
+    defer ptrs.deinit(std.testing.allocator);
+
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const obj = try heap.alloc(200, .{});
+        try ptrs.append(std.testing.allocator, @intFromPtr(obj.ptr));
+    }
+
+    try std.testing.expect(heap.blockCount() > 0);
+
+    // Keep only even objects alive
+    var live_roots = std.ArrayList(usize).empty;
+    defer live_roots.deinit(std.testing.allocator);
+
+    for (ptrs.items, 0..) |ptr, index| {
+        if (index % 2 == 0) {
+            try live_roots.append(std.testing.allocator, ptr);
+        }
+    }
+
+    const tracer = struct {
+        fn trace(_: *anyopaque, _: []u8, _: VisitSlotFn, _: *anyopaque) void {}
+    }.trace;
+    var dummy: u8 = 0;
+    heap.setTracer(tracer, &dummy);
+
+    const stats1 = try heap.collect(live_roots.items);
+    try std.testing.expectEqual(@as(usize, 50), stats1.objects_live);
+    try std.testing.expectEqual(@as(usize, 50), stats1.objects_reclaimed);
+
+    // Re-allocate into freed holes
+    var new_ptrs = std.ArrayList(usize).empty;
+    defer new_ptrs.deinit(std.testing.allocator);
+
+    i = 0;
+    while (i < 50) : (i += 1) {
+        const obj = try heap.alloc(200, .{});
+        try new_ptrs.append(std.testing.allocator, @intFromPtr(obj.ptr));
+    }
+
+    var all_roots = std.ArrayList(usize).empty;
+    defer all_roots.deinit(std.testing.allocator);
+    try all_roots.appendSlice(std.testing.allocator, live_roots.items);
+    try all_roots.appendSlice(std.testing.allocator, new_ptrs.items);
+
+    const stats2 = try heap.collect(all_roots.items);
+    try std.testing.expectEqual(@as(usize, 100), stats2.objects_live);
+    try heap.validate();
+}
+
+test "safepoint flags and configuration limits" {
+    var heap = ImmixAllocator.init(std.testing.allocator, .{ .max_blocks = 2 });
+    defer heap.deinit();
+
+    try std.testing.expect(!heap.pause_requested);
+    heap.requestSafepoint();
+    try std.testing.expect(heap.pause_requested);
+    heap.releaseSafepoint();
+    try std.testing.expect(!heap.pause_requested);
+
+    // Rejection of oversize objects in standard pool
+    try std.testing.expectError(AllocError.ObjectTooLarge, heap.alloc(5000, .{}));
 }
